@@ -1,0 +1,452 @@
+//@version=5
+indicator("Session Extreme Revisit — Pro", "SERAS·Pro", overlay=true,
+          max_boxes_count=60, max_labels_count=10)
+
+// ══════════════════════════════════════════════════════════════
+//  INPUTS
+// ══════════════════════════════════════════════════════════════
+g1 = "Sessions"
+i_lon_sess   = input.session("0700-1000", "London Session",   group=g1)
+i_ny_sess    = input.session("1200-1600", "New York Session", group=g1)
+i_tz         = input.string("UTC", "Timezone", group=g1,
+               options=["UTC","America/New_York","Europe/London","Asia/Singapore","America/Chicago"])
+
+g2 = "Zone Appearance"
+i_hi_fill    = input.color(color.new(color.red,  80), "Supply Zone Fill",  group=g2)
+i_lo_fill    = input.color(color.new(color.lime, 80), "Demand Zone Fill",  group=g2)
+i_hi_bdr     = input.color(color.red,               "Supply Zone Border", group=g2)
+i_lo_bdr     = input.color(color.lime,              "Demand Zone Border", group=g2)
+i_show_lbl   = input.bool(true, "Show Zone Labels in Box",                 group=g2)
+i_show_bg    = input.bool(true, "Session Background",                      group=g2)
+
+g3 = "Institutional Filters"
+i_use_filt   = input.bool(true,  "Enable Filters", group=g3,
+               tooltip="Only zones whose extreme candle passes size and wick criteria become active")
+i_atr_mult   = input.float(0.3,  "Min Candle Size (× ATR-14)", group=g3, minval=0.0, step=0.05,
+               tooltip="Extreme candle range must be at least this multiple of ATR-14")
+i_wick_ratio = input.float(0.20, "Min Wick Ratio (0–1)", group=g3, minval=0.0, maxval=1.0, step=0.05,
+               tooltip="(Upper wick + lower wick) / total range — filters for rejection/manipulation candles")
+i_use_disp   = input.bool(true,  "Require Displacement", group=g3,
+               tooltip="Session must close N× ATR away from the extreme — confirms price moved off the zone")
+i_disp_mult  = input.float(0.5,  "Displacement Threshold (× ATR)", group=g3, minval=0.1, step=0.1)
+
+g4 = "HTF Trend Bias"
+i_use_htf    = input.bool(true, "Enable HTF Bias Filter", group=g4,
+               tooltip="Supply alerts only when HTF trend is bearish; demand alerts only when HTF trend is bullish")
+i_htf        = input.timeframe("240", "HTF Timeframe", group=g4)
+i_htf_len    = input.int(50, "HTF EMA Length", group=g4, minval=1)
+
+g5 = "Kill Zones (High-Probability Time Windows)"
+i_use_kz     = input.bool(true, "Restrict Alerts to Kill Zones", group=g5,
+               tooltip="Alerts only fire during the configured kill zone windows below")
+i_lkz        = input.session("0700-0900", "London Open Kill Zone",   group=g5)
+i_nkz        = input.session("1200-1400", "NY Open Kill Zone",       group=g5)
+i_lc_kz      = input.session("1500-1600", "London Close Kill Zone",  group=g5)
+
+g6 = "Signal Confirmation"
+i_confirm    = input.string("First Touch", "Signal Mode", group=g6,
+               options=["First Touch", "Rejection Candle"],
+               tooltip="First Touch: alert fires immediately when price enters zone.\nRejection Candle: waits for a bearish/bullish pin bar to close inside the zone.")
+i_pin_ratio  = input.float(1.5, "Pin Bar Wick / Body Ratio", group=g6, minval=0.5, step=0.1,
+               tooltip="Candle wick must be at least this multiple of the body to qualify as a pin bar")
+
+g7 = "Zone Memory & Expiry"
+i_max_zones  = input.int(3, "Max Zones to Remember Per Side", group=g7, minval=1, maxval=5,
+               tooltip="How many recent session zones to keep active per zone type (e.g. 3 = last 3 London High zones)")
+i_expire     = input.bool(true, "Expire on Full Mitigation", group=g7,
+               tooltip="Supply zone expires when a candle closes above its top.\nDemand zone expires when a candle closes below its bottom.")
+i_max_bars   = input.int(10000, "Max Active Bars (Zone Lifetime)", group=g7,
+               minval=100, maxval=100000,
+               tooltip="Zones remain active for this many bars regardless of mitigation.\n10000 bars ≈ 35 days on a 5-min chart, ≈ 14 months on a 1H chart.")
+
+// ══════════════════════════════════════════════════════════════
+//  SESSION & KILL ZONE FLAGS
+// ══════════════════════════════════════════════════════════════
+in_lon   = not na(time(timeframe.period, i_lon_sess, i_tz))
+in_ny    = not na(time(timeframe.period, i_ny_sess,  i_tz))
+
+lon_open  = in_lon and not in_lon[1]
+lon_close = not in_lon and in_lon[1]
+ny_open   = in_ny  and not in_ny[1]
+ny_close  = not in_ny  and in_ny[1]
+
+in_lkz   = not na(time(timeframe.period, i_lkz,   i_tz))
+in_nkz   = not na(time(timeframe.period, i_nkz,   i_tz))
+in_lc_kz = not na(time(timeframe.period, i_lc_kz, i_tz))
+in_kz    = in_lkz or in_nkz or in_lc_kz
+
+// ══════════════════════════════════════════════════════════════
+//  HTF BIAS — EMA on higher timeframe
+// ══════════════════════════════════════════════════════════════
+[htf_close, htf_ema_val] = request.security(syminfo.tickerid, i_htf,
+    [close, ta.ema(close, i_htf_len)], lookahead=barmerge.lookahead_off)
+htf_bull = htf_close > htf_ema_val
+htf_bear = htf_close < htf_ema_val
+
+// ══════════════════════════════════════════════════════════════
+//  ATR
+// ══════════════════════════════════════════════════════════════
+atr = ta.atr(14)
+
+// ══════════════════════════════════════════════════════════════
+//  INTRA-SESSION TRACKING VARIABLES
+//  (stores the extreme candle's OHLC + bar index during the session)
+// ══════════════════════════════════════════════════════════════
+// London high candle
+var float lh_H = na; var float lh_L = na; var float lh_O = na; var float lh_C = na; var int lh_bi = na
+// London low candle
+var float ll_H = na; var float ll_L = na; var float ll_O = na; var float ll_C = na; var int ll_bi = na
+// London running extremes
+var float lon_rH = na; var float lon_rL = na
+// NY high candle
+var float nh_H = na; var float nh_L = na; var float nh_O = na; var float nh_C = na; var int nh_bi = na
+// NY low candle
+var float nl_H = na; var float nl_L = na; var float nl_O = na; var float nl_C = na; var int nl_bi = na
+// NY running extremes
+var float ny_rH = na; var float ny_rL = na
+
+// ══════════════════════════════════════════════════════════════
+//  MULTI-ZONE ARRAYS  (index 0 = newest zone, n-1 = oldest)
+// ══════════════════════════════════════════════════════════════
+// Each zone type has 6 parallel arrays: high, low, created-bar, active-flag, prev-in-zone, box
+var lhH_a  = array.new_float(); var lhL_a  = array.new_float()   // London High zones
+var lhC_a  = array.new_int();   var lhAct  = array.new_bool()
+var lhPrv  = array.new_bool();  var lhBx_a = array.new<box>()
+
+var llH_a  = array.new_float(); var llL_a  = array.new_float()   // London Low zones
+var llC_a  = array.new_int();   var llAct  = array.new_bool()
+var llPrv  = array.new_bool();  var llBx_a = array.new<box>()
+
+var nhH_a  = array.new_float(); var nhL_a  = array.new_float()   // NY High zones
+var nhC_a  = array.new_int();   var nhAct  = array.new_bool()
+var nhPrv  = array.new_bool();  var nhBx_a = array.new<box>()
+
+var nlH_a  = array.new_float(); var nlL_a  = array.new_float()   // NY Low zones
+var nlC_a  = array.new_int();   var nlAct  = array.new_bool()
+var nlPrv  = array.new_bool();  var nlBx_a = array.new<box>()
+
+// ══════════════════════════════════════════════════════════════
+//  REJECTION CANDLE DETECTION  (recomputed every bar)
+// ══════════════════════════════════════════════════════════════
+_body    = math.max(math.abs(close - open), (high - low) * 0.01)
+_u_wick  = high - math.max(open, close)
+_l_wick  = math.min(open, close) - low
+bear_pin = close < open and _u_wick >= _body * i_pin_ratio   // bearish pin / shooting star
+bull_pin = close > open and _l_wick >= _body * i_pin_ratio   // bullish pin / hammer
+
+// ══════════════════════════════════════════════════════════════
+//  INSTITUTIONAL QUALIFICATION FILTER
+// ══════════════════════════════════════════════════════════════
+f_qual(h, l, o, c, disp_ok) =>
+    if not i_use_filt
+        true
+    else
+        rng  = h - l
+        wick = (h - math.max(o, c)) + (math.min(o, c) - l)
+        rng >= i_atr_mult * atr and
+         (rng > 0 ? wick / rng >= i_wick_ratio : false) and
+         (not i_use_disp or disp_ok)
+
+// ══════════════════════════════════════════════════════════════
+//  HELPER: CREATE ZONE BOX  (text label embedded directly in box)
+// ══════════════════════════════════════════════════════════════
+f_make_box(bi, zh, zl, is_hi, lbl) =>
+    bc  = is_hi ? i_hi_bdr   : i_lo_bdr
+    bg  = is_hi ? i_hi_fill  : i_lo_fill
+    tc  = is_hi ? color.red  : color.lime
+    va  = is_hi ? text.align_top : text.align_bottom
+    box.new(bi, zh, bar_index, zl,
+            border_color=bc, bgcolor=bg, extend=extend.right,
+            text=i_show_lbl ? lbl : "",
+            text_color=tc, text_size=size.tiny,
+            text_halign=text.align_left, text_valign=va)
+
+// ══════════════════════════════════════════════════════════════
+//  HELPER: PUSH NEW ZONE INTO ARRAYS, EVICT OLDEST IF OVER CAP
+// ══════════════════════════════════════════════════════════════
+f_push(Ha, La, Ca, Aa, Pa, Ba, zh, zl, bi, bx) =>
+    array.unshift(Ha, zh); array.unshift(La, zl)
+    array.unshift(Ca, bi); array.unshift(Aa, true); array.unshift(Pa, false)
+    array.unshift(Ba, bx)
+    if array.size(Ha) > i_max_zones
+        array.pop(Ha); array.pop(La); array.pop(Ca); array.pop(Aa); array.pop(Pa)
+        old_bx = array.pop(Ba)
+        if not na(old_bx)
+            box.delete(old_bx)
+
+// ══════════════════════════════════════════════════════════════
+//  LONDON SESSION TRACKING
+// ══════════════════════════════════════════════════════════════
+if lon_open
+    lon_rH := high; lon_rL := low
+    lh_H := high; lh_L := low; lh_O := open; lh_C := close; lh_bi := bar_index
+    ll_H := high; ll_L := low; ll_O := open; ll_C := close; ll_bi := bar_index
+
+if in_lon and not lon_open
+    if high > lon_rH
+        lon_rH := high
+        lh_H := high; lh_L := low; lh_O := open; lh_C := close; lh_bi := bar_index
+    if low < lon_rL
+        lon_rL := low
+        ll_H := high; ll_L := low; ll_O := open; ll_C := close; ll_bi := bar_index
+
+if lon_close
+    // close[1] = last bar of London session; measure displacement from session extremes
+    hi_disp = (lh_H - close[1]) >= i_disp_mult * atr
+    lo_disp = (close[1] - ll_L) >= i_disp_mult * atr
+    if f_qual(lh_H, lh_L, lh_O, lh_C, hi_disp)
+        bx = f_make_box(lh_bi, lh_H, lh_L, true,
+             "LON HIGH  " + str.tostring(lh_H, format.mintick) + " – " + str.tostring(lh_L, format.mintick))
+        f_push(lhH_a, lhL_a, lhC_a, lhAct, lhPrv, lhBx_a, lh_H, lh_L, lh_bi, bx)
+    if f_qual(ll_H, ll_L, ll_O, ll_C, lo_disp)
+        bx = f_make_box(ll_bi, ll_H, ll_L, false,
+             "LON LOW  " + str.tostring(ll_H, format.mintick) + " – " + str.tostring(ll_L, format.mintick))
+        f_push(llH_a, llL_a, llC_a, llAct, llPrv, llBx_a, ll_H, ll_L, ll_bi, bx)
+
+// ══════════════════════════════════════════════════════════════
+//  NEW YORK SESSION TRACKING
+// ══════════════════════════════════════════════════════════════
+if ny_open
+    ny_rH := high; ny_rL := low
+    nh_H := high; nh_L := low; nh_O := open; nh_C := close; nh_bi := bar_index
+    nl_H := high; nl_L := low; nl_O := open; nl_C := close; nl_bi := bar_index
+
+if in_ny and not ny_open
+    if high > ny_rH
+        ny_rH := high
+        nh_H := high; nh_L := low; nh_O := open; nh_C := close; nh_bi := bar_index
+    if low < ny_rL
+        ny_rL := low
+        nl_H := high; nl_L := low; nl_O := open; nl_C := close; nl_bi := bar_index
+
+if ny_close
+    hi_disp = (nh_H - close[1]) >= i_disp_mult * atr
+    lo_disp = (close[1] - nl_L) >= i_disp_mult * atr
+    if f_qual(nh_H, nh_L, nh_O, nh_C, hi_disp)
+        bx = f_make_box(nh_bi, nh_H, nh_L, true,
+             "NY HIGH  " + str.tostring(nh_H, format.mintick) + " – " + str.tostring(nh_L, format.mintick))
+        f_push(nhH_a, nhL_a, nhC_a, nhAct, nhPrv, nhBx_a, nh_H, nh_L, nh_bi, bx)
+    if f_qual(nl_H, nl_L, nl_O, nl_C, lo_disp)
+        bx = f_make_box(nl_bi, nl_H, nl_L, false,
+             "NY LOW  " + str.tostring(nl_H, format.mintick) + " – " + str.tostring(nl_L, format.mintick))
+        f_push(nlH_a, nlL_a, nlC_a, nlAct, nlPrv, nlBx_a, nl_H, nl_L, nl_bi, bx)
+
+// ══════════════════════════════════════════════════════════════
+//  ZONE PROCESSING — EXPIRY + TOUCH DETECTION
+//  Runs every bar across all active zones in all four arrays.
+//  Priority: newest zone (index 0) sets the alert message values.
+// ══════════════════════════════════════════════════════════════
+kz_ok       = not i_use_kz or in_kz
+htf_ok_bear = not i_use_htf or htf_bear
+htf_ok_bull = not i_use_htf or htf_bull
+
+// Per-bar signal flags and info (reset to false/na every bar)
+var bool supply_signal  = false; supply_signal  := false
+var bool demand_signal  = false; demand_signal  := false
+var bool supply_confirm = false; supply_confirm := false
+var bool demand_confirm = false; demand_confirm := false
+var float s_zh = na;  s_zh := na;  var float s_zl = na;  s_zl := na
+var float d_zh = na;  d_zh := na;  var float d_zl = na;  d_zl := na
+var string s_src = ""; s_src := ""; var string d_src = ""; d_src := ""
+
+// ── LONDON HIGH ZONES (supply) ───────────────────────────────
+for i = 0 to array.size(lhH_a) - 1
+    if array.get(lhAct, i)
+        zh  = array.get(lhH_a, i)
+        zl  = array.get(lhL_a, i)
+        age = bar_index - array.get(lhC_a, i)
+        expired = age > i_max_bars or (i_expire and close > zh)
+        if expired
+            array.set(lhAct, i, false)
+            array.set(lhPrv,  i, false)
+            bx = array.get(lhBx_a, i)
+            if not na(bx)
+                box.set_bgcolor(bx, color.new(color.gray, 92))
+                box.set_border_color(bx, color.new(color.gray, 70))
+                box.set_extend(bx, extend.none)
+        else
+            in_z = not in_lon and high >= zl and low <= zh
+            prev = array.get(lhPrv, i)
+            array.set(lhPrv, i, in_z)
+            if in_z and kz_ok and htf_ok_bear
+                if i_confirm == "First Touch" and not prev
+                    if not supply_signal
+                        supply_signal := true
+                        s_zh := zh; s_zl := zl; s_src := "London Session HIGH"
+                if i_confirm == "Rejection Candle" and bear_pin
+                    if not supply_confirm
+                        supply_confirm := true
+                        s_zh := zh; s_zl := zl; s_src := "London Session HIGH"
+
+// ── LONDON LOW ZONES (demand) ────────────────────────────────
+for i = 0 to array.size(llH_a) - 1
+    if array.get(llAct, i)
+        zh  = array.get(llH_a, i)
+        zl  = array.get(llL_a, i)
+        age = bar_index - array.get(llC_a, i)
+        expired = age > i_max_bars or (i_expire and close < zl)
+        if expired
+            array.set(llAct, i, false)
+            array.set(llPrv,  i, false)
+            bx = array.get(llBx_a, i)
+            if not na(bx)
+                box.set_bgcolor(bx, color.new(color.gray, 92))
+                box.set_border_color(bx, color.new(color.gray, 70))
+                box.set_extend(bx, extend.none)
+        else
+            in_z = not in_lon and high >= zl and low <= zh
+            prev = array.get(llPrv, i)
+            array.set(llPrv, i, in_z)
+            if in_z and kz_ok and htf_ok_bull
+                if i_confirm == "First Touch" and not prev
+                    if not demand_signal
+                        demand_signal := true
+                        d_zh := zh; d_zl := zl; d_src := "London Session LOW"
+                if i_confirm == "Rejection Candle" and bull_pin
+                    if not demand_confirm
+                        demand_confirm := true
+                        d_zh := zh; d_zl := zl; d_src := "London Session LOW"
+
+// ── NY HIGH ZONES (supply) ───────────────────────────────────
+for i = 0 to array.size(nhH_a) - 1
+    if array.get(nhAct, i)
+        zh  = array.get(nhH_a, i)
+        zl  = array.get(nhL_a, i)
+        age = bar_index - array.get(nhC_a, i)
+        expired = age > i_max_bars or (i_expire and close > zh)
+        if expired
+            array.set(nhAct, i, false)
+            array.set(nhPrv,  i, false)
+            bx = array.get(nhBx_a, i)
+            if not na(bx)
+                box.set_bgcolor(bx, color.new(color.gray, 92))
+                box.set_border_color(bx, color.new(color.gray, 70))
+                box.set_extend(bx, extend.none)
+        else
+            in_z = not in_ny and high >= zl and low <= zh
+            prev = array.get(nhPrv, i)
+            array.set(nhPrv, i, in_z)
+            if in_z and kz_ok and htf_ok_bear
+                if i_confirm == "First Touch" and not prev
+                    if not supply_signal
+                        supply_signal := true
+                        s_zh := zh; s_zl := zl; s_src := "New York Session HIGH"
+                if i_confirm == "Rejection Candle" and bear_pin
+                    if not supply_confirm
+                        supply_confirm := true
+                        s_zh := zh; s_zl := zl; s_src := "New York Session HIGH"
+
+// ── NY LOW ZONES (demand) ────────────────────────────────────
+for i = 0 to array.size(nlH_a) - 1
+    if array.get(nlAct, i)
+        zh  = array.get(nlH_a, i)
+        zl  = array.get(nlL_a, i)
+        age = bar_index - array.get(nlC_a, i)
+        expired = age > i_max_bars or (i_expire and close < zl)
+        if expired
+            array.set(nlAct, i, false)
+            array.set(nlPrv,  i, false)
+            bx = array.get(nlBx_a, i)
+            if not na(bx)
+                box.set_bgcolor(bx, color.new(color.gray, 92))
+                box.set_border_color(bx, color.new(color.gray, 70))
+                box.set_extend(bx, extend.none)
+        else
+            in_z = not in_ny and high >= zl and low <= zh
+            prev = array.get(nlPrv, i)
+            array.set(nlPrv, i, in_z)
+            if in_z and kz_ok and htf_ok_bull
+                if i_confirm == "First Touch" and not prev
+                    if not demand_signal
+                        demand_signal := true
+                        d_zh := zh; d_zl := zl; d_src := "New York Session LOW"
+                if i_confirm == "Rejection Candle" and bull_pin
+                    if not demand_confirm
+                        demand_confirm := true
+                        d_zh := zh; d_zl := zl; d_src := "New York Session LOW"
+
+// ══════════════════════════════════════════════════════════════
+//  DYNAMIC ALERTS  (rich messages with live zone info)
+//  Setup: Add Alert → this indicator → "Any alert() function call"
+// ══════════════════════════════════════════════════════════════
+_sym  = syminfo.ticker
+_sess = in_lon ? "London" : in_ny ? "New York" : "Off-Session"
+_htf  = htf_bull ? "Bullish" : htf_bear ? "Bearish" : "Neutral"
+
+if supply_signal and not na(s_zh)
+    alert(_sym + " — SUPPLY ZONE REVISIT\n" +
+          "Source : " + s_src + "\n" +
+          "Zone   : " + str.tostring(s_zl, format.mintick) + " – " + str.tostring(s_zh, format.mintick) + "\n" +
+          "Session: " + _sess + "  |  HTF: " + _htf + " (bearish)  |  Kill Zone: " + (in_kz ? "YES" : "NO") + "\n" +
+          "Potential supply / distribution / reversal area",
+          alert.freq_once_per_bar)
+
+if demand_signal and not na(d_zh)
+    alert(_sym + " — DEMAND ZONE REVISIT\n" +
+          "Source : " + d_src + "\n" +
+          "Zone   : " + str.tostring(d_zl, format.mintick) + " – " + str.tostring(d_zh, format.mintick) + "\n" +
+          "Session: " + _sess + "  |  HTF: " + _htf + " (bullish)  |  Kill Zone: " + (in_kz ? "YES" : "NO") + "\n" +
+          "Potential demand / accumulation / reversal area",
+          alert.freq_once_per_bar)
+
+if supply_confirm and not na(s_zh)
+    alert(_sym + " — CONFIRMED BEARISH REJECTION\n" +
+          "Source : " + s_src + "\n" +
+          "Zone   : " + str.tostring(s_zl, format.mintick) + " – " + str.tostring(s_zh, format.mintick) + "\n" +
+          "Bearish pin bar detected inside supply zone\n" +
+          "Session: " + _sess + "  |  HTF: " + _htf,
+          alert.freq_once_per_bar)
+
+if demand_confirm and not na(d_zh)
+    alert(_sym + " — CONFIRMED BULLISH REJECTION\n" +
+          "Source : " + d_src + "\n" +
+          "Zone   : " + str.tostring(d_zl, format.mintick) + " – " + str.tostring(d_zh, format.mintick) + "\n" +
+          "Bullish pin bar detected inside demand zone\n" +
+          "Session: " + _sess + "  |  HTF: " + _htf,
+          alert.freq_once_per_bar)
+
+// ══════════════════════════════════════════════════════════════
+//  ALERTCONDITIONS  (static — selectable from Alerts dialog)
+// ══════════════════════════════════════════════════════════════
+alertcondition(supply_signal,
+               "Supply Zone Revisit",
+               "Supply zone revisited — HTF bearish + kill zone aligned")
+alertcondition(demand_signal,
+               "Demand Zone Revisit",
+               "Demand zone revisited — HTF bullish + kill zone aligned")
+alertcondition(supply_confirm,
+               "Supply Zone Confirmed (Pin Bar)",
+               "Bearish rejection candle at supply zone — potential short setup")
+alertcondition(demand_confirm,
+               "Demand Zone Confirmed (Pin Bar)",
+               "Bullish rejection candle at demand zone — potential long setup")
+alertcondition(supply_signal or demand_signal,
+               "Any Zone Revisit",
+               "Session extreme zone revisited — check chart")
+alertcondition(supply_confirm or demand_confirm,
+               "Any Confirmed Signal",
+               "Confirmed rejection candle at session zone — higher-quality setup")
+
+// ══════════════════════════════════════════════════════════════
+//  VISUAL MARKERS ON CHART
+// ══════════════════════════════════════════════════════════════
+// Small shapes = first-touch entry; Large shapes = confirmed rejection
+plotshape(supply_signal,  "Supply Entry",     shape.triangledown, location.abovebar,
+          color=color.red,    size=size.small,  title="Supply Zone Touch")
+plotshape(demand_signal,  "Demand Entry",     shape.triangleup,   location.belowbar,
+          color=color.lime,   size=size.small,  title="Demand Zone Touch")
+plotshape(supply_confirm, "Supply Confirmed", shape.triangledown, location.abovebar,
+          color=color.maroon, size=size.normal, title="Supply Confirmed Rejection")
+plotshape(demand_confirm, "Demand Confirmed", shape.triangleup,   location.belowbar,
+          color=color.green,  size=size.normal, title="Demand Confirmed Rejection")
+
+// HTF EMA — trend reference line
+plot(htf_ema_val, "HTF EMA (" + str.tostring(i_htf_len) + ")",
+     color=color.new(color.orange, 55), linewidth=1, style=plot.style_line)
+
+// Session backgrounds
+bgcolor(i_show_bg and in_lon ? color.new(color.blue,   96) : na, title="London Session")
+bgcolor(i_show_bg and in_ny  ? color.new(color.purple, 96) : na, title="NY Session")
+
+// Kill zone highlight
+bgcolor(i_use_kz and in_kz ? color.new(color.yellow, 93) : na, title="Kill Zone")
