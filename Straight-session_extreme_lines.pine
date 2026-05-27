@@ -1,0 +1,432 @@
+//@version=5
+indicator("Session Extreme Revisit — Lines", "SEL·Pro", overlay=true,
+          max_boxes_count=100, max_labels_count=20)
+
+// ══════════════════════════════════════════════════════════════
+//  INPUTS
+// ══════════════════════════════════════════════════════════════
+g1 = "Sessions"
+i_lon_sess = input.session("0700-1000", "London Session",   group=g1)
+i_ny_sess  = input.session("1200-1600", "New York Session", group=g1)
+i_tz       = input.string("UTC", "Timezone", group=g1,
+             options=["UTC","America/New_York","Europe/London","Asia/Singapore","America/Chicago"])
+
+g2 = "Zone Appearance"
+i_hi_fill  = input.color(color.new(color.red,  80), "Supply Zone Fill",  group=g2)
+i_lo_fill  = input.color(color.new(color.lime, 80), "Demand Zone Fill",  group=g2)
+i_hi_bdr   = input.color(color.red,               "Supply Zone Border", group=g2)
+i_lo_bdr   = input.color(color.lime,              "Demand Zone Border", group=g2)
+i_show_lbl = input.bool(true, "Show Zone Labels",                        group=g2)
+i_show_bg  = input.bool(true, "Session Background",                      group=g2)
+
+g7 = "Zone Memory and Expiry"
+i_max_zones = input.int(3, "Max Zones Per Side", group=g7, minval=1, maxval=5)
+i_expire    = input.bool(true, "Expire on Full Mitigation", group=g7,
+              tooltip="Supply expires when close > zone top. Demand expires when close < zone bottom.")
+i_max_bars  = input.int(10000, "Max Active Bars", group=g7, minval=100, maxval=100000,
+              tooltip="10000 bars ≈ 35 days on 5m or 14 months on 1H.")
+
+// ══════════════════════════════════════════════════════════════
+//  SESSION FLAGS
+// ══════════════════════════════════════════════════════════════
+in_lon    = not na(time(timeframe.period, i_lon_sess, i_tz))
+in_ny     = not na(time(timeframe.period, i_ny_sess,  i_tz))
+
+lon_open  = in_lon and not in_lon[1]
+lon_close = not in_lon and in_lon[1]
+ny_open   = in_ny  and not in_ny[1]
+ny_close  = not in_ny  and in_ny[1]
+
+// ══════════════════════════════════════════════════════════════
+//  INTRA-SESSION TRACKING VARIABLES
+// ══════════════════════════════════════════════════════════════
+var float lh_H  = na
+var float lh_L  = na
+var int   lh_bi = na
+
+var float ll_H  = na
+var float ll_L  = na
+var int   ll_bi = na
+
+var float lon_rH = na
+var float lon_rL = na
+
+var float nh_H  = na
+var float nh_L  = na
+var int   nh_bi = na
+
+var float nl_H  = na
+var float nl_L  = na
+var int   nl_bi = na
+
+var float ny_rH = na
+var float ny_rL = na
+
+// ══════════════════════════════════════════════════════════════
+//  LIVE DASHED BOXES (update during session, removed at close)
+// ══════════════════════════════════════════════════════════════
+var box lh_live = na
+var box ll_live = na
+var box nh_live = na
+var box nl_live = na
+
+// ══════════════════════════════════════════════════════════════
+//  ZONE ARRAYS  (index 0 = newest, last index = oldest)
+// ══════════════════════════════════════════════════════════════
+var lhH_a  = array.new_float()
+var lhL_a  = array.new_float()
+var lhC_a  = array.new_int()
+var lhAct  = array.new_bool()
+var lhPrv  = array.new_bool()
+var lhBx_a = array.new<box>()
+var lhVc_a = array.new_int()
+
+var llH_a  = array.new_float()
+var llL_a  = array.new_float()
+var llC_a  = array.new_int()
+var llAct  = array.new_bool()
+var llPrv  = array.new_bool()
+var llBx_a = array.new<box>()
+var llVc_a = array.new_int()
+
+var nhH_a  = array.new_float()
+var nhL_a  = array.new_float()
+var nhC_a  = array.new_int()
+var nhAct  = array.new_bool()
+var nhPrv  = array.new_bool()
+var nhBx_a = array.new<box>()
+var nhVc_a = array.new_int()
+
+var nlH_a  = array.new_float()
+var nlL_a  = array.new_float()
+var nlC_a  = array.new_int()
+var nlAct  = array.new_bool()
+var nlPrv  = array.new_bool()
+var nlBx_a = array.new<box>()
+var nlVc_a = array.new_int()
+
+// ══════════════════════════════════════════════════════════════
+//  HELPER: CREATE ZONE BOX
+// ══════════════════════════════════════════════════════════════
+f_make_box(bi, zh, zl, is_hi, lbl) =>
+    bc = is_hi ? i_hi_bdr  : i_lo_bdr
+    bg = is_hi ? i_hi_fill : i_lo_fill
+    tc = is_hi ? color.red : color.lime
+    va = is_hi ? text.align_top : text.align_bottom
+    box.new(bi, zh, bar_index, zl, border_color=bc, bgcolor=bg, extend=extend.right, text=i_show_lbl ? lbl : "", text_color=tc, text_size=size.tiny, text_halign=text.align_left, text_valign=va)
+
+// ══════════════════════════════════════════════════════════════
+//  HELPER: PUSH ZONE INTO ARRAY, EVICT OLDEST OVER CAP
+// ══════════════════════════════════════════════════════════════
+f_push(Ha, La, Ca, Aa, Pa, Ba, Vc, zh, zl, bi, bx, init_prev, max_z) =>
+    array.unshift(Ha, zh)
+    array.unshift(La, zl)
+    array.unshift(Ca, bi)
+    array.unshift(Aa, true)
+    array.unshift(Pa, init_prev)
+    array.unshift(Ba, bx)
+    array.unshift(Vc, 0)
+    if array.size(Ha) > max_z
+        array.pop(Ha)
+        array.pop(La)
+        array.pop(Ca)
+        array.pop(Aa)
+        array.pop(Pa)
+        old_bx = array.pop(Ba)
+        if not na(old_bx)
+            box.delete(old_bx)
+        array.pop(Vc)
+
+// ══════════════════════════════════════════════════════════════
+//  LONDON SESSION TRACKING
+// ══════════════════════════════════════════════════════════════
+if lon_open
+    lon_rH := high
+    lon_rL := low
+    lh_H  := high
+    lh_L  := low
+    lh_bi := bar_index
+    ll_H  := high
+    ll_L  := low
+    ll_bi := bar_index
+    if not na(lh_live)
+        box.delete(lh_live)
+    if not na(ll_live)
+        box.delete(ll_live)
+    lh_live := box.new(bar_index, high, bar_index + 1, low, border_color=color.new(i_hi_bdr, 0), bgcolor=color.new(i_hi_fill, 60), extend=extend.right, border_style=line.style_dashed, border_width=1)
+    ll_live := box.new(bar_index, high, bar_index + 1, low, border_color=color.new(i_lo_bdr, 0), bgcolor=color.new(i_lo_fill, 60), extend=extend.right, border_style=line.style_dashed, border_width=1)
+
+if in_lon and not lon_open
+    if high > lon_rH
+        lon_rH := high
+        lh_H   := high
+        lh_L   := low
+        lh_bi  := bar_index
+    if low < lon_rL
+        lon_rL := low
+        ll_H   := high
+        ll_L   := low
+        ll_bi  := bar_index
+
+if in_lon and not na(lh_live)
+    box.set_left(lh_live, lh_bi)
+    box.set_top(lh_live, lh_H)
+    box.set_bottom(lh_live, lh_L)
+if in_lon and not na(ll_live)
+    box.set_left(ll_live, ll_bi)
+    box.set_top(ll_live, ll_H)
+    box.set_bottom(ll_live, ll_L)
+
+if lon_close
+    if not na(lh_live)
+        box.delete(lh_live)
+        lh_live := na
+    if not na(ll_live)
+        box.delete(ll_live)
+        ll_live := na
+    bx_h = f_make_box(lh_bi, lh_H, lh_L, true, "LON HIGH " + str.tostring(lh_H, format.mintick) + " - " + str.tostring(lh_L, format.mintick))
+    f_push(lhH_a, lhL_a, lhC_a, lhAct, lhPrv, lhBx_a, lhVc_a, lh_H, lh_L, lh_bi, bx_h, high >= lh_L and low <= lh_H, i_max_zones)
+    bx_l = f_make_box(ll_bi, ll_H, ll_L, false, "LON LOW " + str.tostring(ll_H, format.mintick) + " - " + str.tostring(ll_L, format.mintick))
+    f_push(llH_a, llL_a, llC_a, llAct, llPrv, llBx_a, llVc_a, ll_H, ll_L, ll_bi, bx_l, high >= ll_L and low <= ll_H, i_max_zones)
+
+// ══════════════════════════════════════════════════════════════
+//  NEW YORK SESSION TRACKING
+// ══════════════════════════════════════════════════════════════
+if ny_open
+    ny_rH := high
+    ny_rL := low
+    nh_H  := high
+    nh_L  := low
+    nh_bi := bar_index
+    nl_H  := high
+    nl_L  := low
+    nl_bi := bar_index
+    if not na(nh_live)
+        box.delete(nh_live)
+    if not na(nl_live)
+        box.delete(nl_live)
+    nh_live := box.new(bar_index, high, bar_index + 1, low, border_color=color.new(i_hi_bdr, 0), bgcolor=color.new(i_hi_fill, 60), extend=extend.right, border_style=line.style_dashed, border_width=1)
+    nl_live := box.new(bar_index, high, bar_index + 1, low, border_color=color.new(i_lo_bdr, 0), bgcolor=color.new(i_lo_fill, 60), extend=extend.right, border_style=line.style_dashed, border_width=1)
+
+if in_ny and not ny_open
+    if high > ny_rH
+        ny_rH := high
+        nh_H  := high
+        nh_L  := low
+        nh_bi := bar_index
+    if low < ny_rL
+        ny_rL := low
+        nl_H  := high
+        nl_L  := low
+        nl_bi := bar_index
+
+if in_ny and not na(nh_live)
+    box.set_left(nh_live, nh_bi)
+    box.set_top(nh_live, nh_H)
+    box.set_bottom(nh_live, nh_L)
+if in_ny and not na(nl_live)
+    box.set_left(nl_live, nl_bi)
+    box.set_top(nl_live, nl_H)
+    box.set_bottom(nl_live, nl_L)
+
+if ny_close
+    if not na(nh_live)
+        box.delete(nh_live)
+        nh_live := na
+    if not na(nl_live)
+        box.delete(nl_live)
+        nl_live := na
+    bx_h = f_make_box(nh_bi, nh_H, nh_L, true, "NY HIGH " + str.tostring(nh_H, format.mintick) + " - " + str.tostring(nh_L, format.mintick))
+    f_push(nhH_a, nhL_a, nhC_a, nhAct, nhPrv, nhBx_a, nhVc_a, nh_H, nh_L, nh_bi, bx_h, high >= nh_L and low <= nh_H, i_max_zones)
+    bx_l = f_make_box(nl_bi, nl_H, nl_L, false, "NY LOW " + str.tostring(nl_H, format.mintick) + " - " + str.tostring(nl_L, format.mintick))
+    f_push(nlH_a, nlL_a, nlC_a, nlAct, nlPrv, nlBx_a, nlVc_a, nl_H, nl_L, nl_bi, bx_l, high >= nl_L and low <= nl_H, i_max_zones)
+
+// ══════════════════════════════════════════════════════════════
+//  ZONE PROCESSING — EXPIRY + TOUCH DETECTION
+// ══════════════════════════════════════════════════════════════
+var bool   supply_signal = false
+var bool   demand_signal = false
+var float  s_zh  = na
+var float  s_zl  = na
+var float  d_zh  = na
+var float  d_zl  = na
+var string s_src = ""
+var string d_src = ""
+var int    s_vc  = 0
+var int    d_vc  = 0
+
+supply_signal := false
+demand_signal := false
+s_zh  := na
+s_zl  := na
+d_zh  := na
+d_zl  := na
+s_src := ""
+d_src := ""
+s_vc  := 0
+d_vc  := 0
+
+// London HIGH zones (supply)
+if array.size(lhH_a) > 0
+    for i = 0 to array.size(lhH_a) - 1
+        if array.get(lhAct, i)
+            zh      = array.get(lhH_a, i)
+            zl      = array.get(lhL_a, i)
+            age     = bar_index - array.get(lhC_a, i)
+            expired = age > i_max_bars or (i_expire and close > zh)
+            if expired
+                array.set(lhAct, i, false)
+                array.set(lhPrv,  i, false)
+                bx = array.get(lhBx_a, i)
+                if not na(bx)
+                    box.set_bgcolor(bx, color.new(color.gray, 92))
+                    box.set_border_color(bx, color.new(color.gray, 70))
+                    box.set_extend(bx, extend.none)
+            else
+                in_z = not in_lon and high >= zl and low <= zh
+                prev = array.get(lhPrv, i)
+                array.set(lhPrv, i, in_z)
+                if in_z and not prev and not supply_signal
+                    supply_signal := true
+                    s_zh  := zh
+                    s_zl  := zl
+                    s_src := "London Session HIGH"
+                    array.set(lhVc_a, i, array.get(lhVc_a, i) + 1)
+                    s_vc  := array.get(lhVc_a, i)
+
+// London LOW zones (demand)
+if array.size(llH_a) > 0
+    for i = 0 to array.size(llH_a) - 1
+        if array.get(llAct, i)
+            zh      = array.get(llH_a, i)
+            zl      = array.get(llL_a, i)
+            age     = bar_index - array.get(llC_a, i)
+            expired = age > i_max_bars or (i_expire and close < zl)
+            if expired
+                array.set(llAct, i, false)
+                array.set(llPrv,  i, false)
+                bx = array.get(llBx_a, i)
+                if not na(bx)
+                    box.set_bgcolor(bx, color.new(color.gray, 92))
+                    box.set_border_color(bx, color.new(color.gray, 70))
+                    box.set_extend(bx, extend.none)
+            else
+                in_z = not in_lon and high >= zl and low <= zh
+                prev = array.get(llPrv, i)
+                array.set(llPrv, i, in_z)
+                if in_z and not prev and not demand_signal
+                    demand_signal := true
+                    d_zh  := zh
+                    d_zl  := zl
+                    d_src := "London Session LOW"
+                    array.set(llVc_a, i, array.get(llVc_a, i) + 1)
+                    d_vc  := array.get(llVc_a, i)
+
+// NY HIGH zones (supply)
+if array.size(nhH_a) > 0
+    for i = 0 to array.size(nhH_a) - 1
+        if array.get(nhAct, i)
+            zh      = array.get(nhH_a, i)
+            zl      = array.get(nhL_a, i)
+            age     = bar_index - array.get(nhC_a, i)
+            expired = age > i_max_bars or (i_expire and close > zh)
+            if expired
+                array.set(nhAct, i, false)
+                array.set(nhPrv,  i, false)
+                bx = array.get(nhBx_a, i)
+                if not na(bx)
+                    box.set_bgcolor(bx, color.new(color.gray, 92))
+                    box.set_border_color(bx, color.new(color.gray, 70))
+                    box.set_extend(bx, extend.none)
+            else
+                in_z = not in_ny and high >= zl and low <= zh
+                prev = array.get(nhPrv, i)
+                array.set(nhPrv, i, in_z)
+                if in_z and not prev and not supply_signal
+                    supply_signal := true
+                    s_zh  := zh
+                    s_zl  := zl
+                    s_src := "New York Session HIGH"
+                    array.set(nhVc_a, i, array.get(nhVc_a, i) + 1)
+                    s_vc  := array.get(nhVc_a, i)
+
+// NY LOW zones (demand)
+if array.size(nlH_a) > 0
+    for i = 0 to array.size(nlH_a) - 1
+        if array.get(nlAct, i)
+            zh      = array.get(nlH_a, i)
+            zl      = array.get(nlL_a, i)
+            age     = bar_index - array.get(nlC_a, i)
+            expired = age > i_max_bars or (i_expire and close < zl)
+            if expired
+                array.set(nlAct, i, false)
+                array.set(nlPrv,  i, false)
+                bx = array.get(nlBx_a, i)
+                if not na(bx)
+                    box.set_bgcolor(bx, color.new(color.gray, 92))
+                    box.set_border_color(bx, color.new(color.gray, 70))
+                    box.set_extend(bx, extend.none)
+            else
+                in_z = not in_ny and high >= zl and low <= zh
+                prev = array.get(nlPrv, i)
+                array.set(nlPrv, i, in_z)
+                if in_z and not prev and not demand_signal
+                    demand_signal := true
+                    d_zh  := zh
+                    d_zl  := zl
+                    d_src := "New York Session LOW"
+                    array.set(nlVc_a, i, array.get(nlVc_a, i) + 1)
+                    d_vc  := array.get(nlVc_a, i)
+
+// ══════════════════════════════════════════════════════════════
+//  DYNAMIC ALERTS
+// ══════════════════════════════════════════════════════════════
+_sym  = syminfo.ticker
+_sess = in_lon ? "London" : in_ny ? "New York" : "Off-Session"
+
+if supply_signal and not na(s_zh)
+    alert(_sym + " - SUPPLY ZONE REVISIT\nSource: " + s_src +
+          "\nZone: " + str.tostring(s_zl, format.mintick) + " - " + str.tostring(s_zh, format.mintick) +
+          "\nSession: " + _sess +
+          "\nRevisit #: " + str.tostring(s_vc) +
+          "\nPotential supply / distribution / reversal area",
+          alert.freq_once_per_bar)
+
+if demand_signal and not na(d_zh)
+    alert(_sym + " - DEMAND ZONE REVISIT\nSource: " + d_src +
+          "\nZone: " + str.tostring(d_zl, format.mintick) + " - " + str.tostring(d_zh, format.mintick) +
+          "\nSession: " + _sess +
+          "\nRevisit #: " + str.tostring(d_vc) +
+          "\nPotential demand / accumulation / reversal area",
+          alert.freq_once_per_bar)
+
+// ══════════════════════════════════════════════════════════════
+//  ALERTCONDITIONS
+// ══════════════════════════════════════════════════════════════
+alertcondition(supply_signal,
+               "Supply Zone Revisit",
+               "Supply zone revisited")
+alertcondition(demand_signal,
+               "Demand Zone Revisit",
+               "Demand zone revisited")
+alertcondition(supply_signal or demand_signal,
+               "Any Zone Revisit",
+               "Session extreme zone revisited - check chart")
+
+// ══════════════════════════════════════════════════════════════
+//  VISUAL MARKERS
+// ══════════════════════════════════════════════════════════════
+plotshape(supply_signal, title="Supply Zone Touch", style=shape.triangledown,
+          location=location.abovebar, color=color.red,  size=size.small)
+if supply_signal
+    label.new(bar_index, high, str.tostring(s_vc), style=label.style_none,
+              color=color.red, textcolor=color.white, size=size.tiny, yloc=yloc.abovebar)
+
+plotshape(demand_signal, title="Demand Zone Touch", style=shape.triangleup,
+          location=location.belowbar, color=color.lime, size=size.small)
+if demand_signal
+    label.new(bar_index, low, str.tostring(d_vc), style=label.style_none,
+              color=color.lime, textcolor=color.white, size=size.tiny, yloc=yloc.belowbar)
+
+bgcolor(i_show_bg and in_lon ? color.new(color.blue,   96) : na, title="London Session")
+bgcolor(i_show_bg and in_ny  ? color.new(color.purple, 96) : na, title="NY Session")
